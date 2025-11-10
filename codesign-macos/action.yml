@@ -100,7 +100,9 @@ runs:
         cd $RUNNER_TEMP
         git clone https://github.com/sparrowwallet/signpackage.git
         cd signpackage
-        ./build.sh
+        # Use package instead of compile to create project artifact first
+        mvn clean package assembly:single
+        cp target/SignPackage-1.0-jar-with-dependencies.jar SignPackage.jar
         mkdir -p $HOME/signpackage-cache
         cp SignPackage.jar $HOME/signpackage-cache/
 
