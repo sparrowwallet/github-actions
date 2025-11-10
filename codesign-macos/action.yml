@@ -1,0 +1,197 @@
+name: 'Codesign, package and notarize macOS app'
+description: 'Signs and notarizes macOS application with DMG creation'
+
+inputs:
+  certificate:
+    description: 'Base64-encoded .p12 certificate file'
+    required: true
+  certificate-password:
+    description: 'Password for the .p12 certificate'
+    required: true
+  apple-id:
+    description: 'Apple ID for notarization'
+    required: true
+  team-id:
+    description: 'Apple Team ID'
+    required: true
+  notarization-password:
+    description: 'App-specific password for notarization'
+    required: true
+  identity:
+    description: 'Signing identity name'
+    required: false
+    default: 'Developer ID Application: Craig Raw (UPLVMSK9D7)'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Extract version from build.gradle
+      id: version
+      shell: bash
+      run: |
+        VERSION=$(grep "^version = " build.gradle | sed "s/version = '\(.*\)'/\1/")
+        echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+        echo "Extracted version: $VERSION"
+
+    - name: Set architecture variables
+      id: arch
+      shell: bash
+      run: |
+        if [[ "${{ runner.arch }}" == "X64" ]]; then
+          echo "ARCH=x86_64" >> $GITHUB_OUTPUT
+          echo "RESOURCE_ARCH=x64" >> $GITHUB_OUTPUT
+        else
+          echo "ARCH=aarch64" >> $GITHUB_OUTPUT
+          echo "RESOURCE_ARCH=aarch64" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Install create-dmg
+      shell: bash
+      run: brew install create-dmg
+
+    - name: Setup signing keychain
+      shell: bash
+      env:
+        MACOS_CERTIFICATE: ${{ inputs.certificate }}
+        MACOS_CERTIFICATE_PASSWORD: ${{ inputs.certificate-password }}
+      run: |
+        # Create temporary keychain
+        KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+        KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+        # Create and unlock keychain
+        security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+        security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+        security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+        # Import certificate
+        echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+        security import certificate.p12 -k "$KEYCHAIN_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+        rm certificate.p12
+
+        # Set keychain search list
+        security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+        # Allow codesign to use the keychain
+        security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+        # Save keychain path for cleanup
+        echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
+
+    - name: Get SignPackage commit hash
+      id: signpackage-version
+      shell: bash
+      run: |
+        COMMIT_HASH=$(git ls-remote https://github.com/sparrowwallet/signpackage.git HEAD | awk '{print $1}')
+        echo "HASH=$COMMIT_HASH" >> $GITHUB_OUTPUT
+        echo "SignPackage HEAD commit: $COMMIT_HASH"
+
+    - name: Cache SignPackage.jar
+      id: cache-signpackage
+      uses: actions/cache@v4
+      with:
+        path: ~/signpackage-cache
+        key: signpackage-${{ steps.signpackage-version.outputs.HASH }}
+
+    - name: Build SignPackage.jar
+      if: steps.cache-signpackage.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        cd $RUNNER_TEMP
+        git clone https://github.com/sparrowwallet/signpackage.git
+        cd signpackage
+        ./build.sh
+        mkdir -p ~/signpackage-cache
+        cp SignPackage.jar ~/signpackage-cache/
+
+    - name: Set SignPackage.jar path
+      shell: bash
+      run: |
+        echo "SIGNPACKAGE_JAR=~/signpackage-cache/SignPackage.jar" >> $GITHUB_ENV
+
+    - name: Sign app contents with SignPackage
+      shell: bash
+      run: |
+        java -jar "$SIGNPACKAGE_JAR" \
+          -d build/jpackage/Sparrow.app \
+          -t -r \
+          -k "${{ inputs.identity }}" \
+          -e src/main/deploy/package/osx/Sparrow.entitlements
+
+    - name: Codesign MacOS executables
+      shell: bash
+      run: |
+        codesign --timestamp \
+          --entitlements src/main/deploy/package/osx/Sparrow.entitlements \
+          --options runtime \
+          -vvv -f \
+          --sign "${{ inputs.identity }}" \
+          build/jpackage/Sparrow.app/Contents/MacOS/*
+
+    - name: Codesign app bundle
+      shell: bash
+      run: |
+        codesign --timestamp \
+          --entitlements src/main/deploy/package/osx/Sparrow.entitlements \
+          --options runtime \
+          -vvv -f \
+          --sign "${{ inputs.identity }}" \
+          build/jpackage/Sparrow.app
+
+    - name: Create DMG
+      shell: bash
+      run: |
+        create-dmg \
+          --volname "Sparrow" \
+          --volicon "src/main/deploy/package/osx/sparrow.icns" \
+          --background "src/main/deploy/package/osx/installer-background.png" \
+          --window-pos 200 140 \
+          --window-size 520 300 \
+          --icon-size 100 \
+          --icon "Sparrow.app" 120 120 \
+          --hide-extension "Sparrow.app" \
+          --app-drop-link 400 120 \
+          "build/jpackage/Sparrow-${{ steps.version.outputs.VERSION }}-${{ steps.arch.outputs.ARCH }}.dmg" \
+          "build/jpackage/"
+
+    - name: Codesign DMG
+      shell: bash
+      run: |
+        codesign --timestamp \
+          --entitlements src/main/deploy/package/osx/Sparrow.entitlements \
+          --options runtime \
+          -vvv -f \
+          --sign "${{ inputs.identity }}" \
+          "build/jpackage/Sparrow-${{ steps.version.outputs.VERSION }}-${{ steps.arch.outputs.ARCH }}.dmg"
+
+    - name: Notarize DMG
+      shell: bash
+      env:
+        APPLE_ID: ${{ inputs.apple-id }}
+        TEAM_ID: ${{ inputs.team-id }}
+        PASSWORD: ${{ inputs.notarization-password }}
+      run: |
+        xcrun notarytool submit --wait \
+          --apple-id "$APPLE_ID" \
+          --team-id "$TEAM_ID" \
+          --password "$PASSWORD" \
+          "build/jpackage/Sparrow-${{ steps.version.outputs.VERSION }}-${{ steps.arch.outputs.ARCH }}.dmg"
+
+    - name: Staple notarization ticket
+      shell: bash
+      run: |
+        xcrun stapler staple -v "build/jpackage/Sparrow-${{ steps.version.outputs.VERSION }}-${{ steps.arch.outputs.ARCH }}.dmg"
+
+    - name: Verify signature
+      shell: bash
+      run: |
+        spctl --assess --type install --context context:primary-signature -v \
+          "build/jpackage/Sparrow-${{ steps.version.outputs.VERSION }}-${{ steps.arch.outputs.ARCH }}.dmg"
+
+    - name: Cleanup keychain
+      if: always()
+      shell: bash
+      run: |
+        if [ -n "$KEYCHAIN_PATH" ]; then
+          security delete-keychain "$KEYCHAIN_PATH" || true
+        fi
