@@ -81,38 +81,19 @@ runs:
         # Save keychain path for cleanup
         echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
 
-    - name: Get SignPackage commit hash
-      id: signpackage-version
-      shell: bash
-      run: |
-        COMMIT_HASH=$(git ls-remote https://github.com/sparrowwallet/signpackage.git HEAD | awk '{print $1}')
-        echo "HASH=$COMMIT_HASH" >> $GITHUB_OUTPUT
-        echo "SignPackage HEAD commit: $COMMIT_HASH"
-
-    - name: Cache SignPackage.jar
-      id: cache-signpackage
-      uses: actions/cache@v5
-      with:
-        path: $HOME/signpackage-cache
-        key: signpackage-${{ steps.signpackage-version.outputs.HASH }}
-
     - name: Build SignPackage.jar
-      if: steps.cache-signpackage.outputs.cache-hit != 'true'
       shell: bash
+      env:
+        SIGNPACKAGE_COMMIT: 61598d6a2b4619bf3d73de0a1f1f58868b9de467
       run: |
         cd $RUNNER_TEMP
         git clone https://github.com/sparrowwallet/signpackage.git
         cd signpackage
+        git -c advice.detachedHead=false checkout --detach "$SIGNPACKAGE_COMMIT"
+        test "$(git rev-parse HEAD)" = "$SIGNPACKAGE_COMMIT"
         # Use package instead of compile to create project artifact first
         mvn clean package assembly:single
-        cp target/SignPackage-1.0-jar-with-dependencies.jar SignPackage.jar
-        mkdir -p $HOME/signpackage-cache
-        cp SignPackage.jar $HOME/signpackage-cache/
-
-    - name: Set SignPackage.jar path
-      shell: bash
-      run: |
-        echo "SIGNPACKAGE_JAR=$HOME/signpackage-cache/SignPackage.jar" >> $GITHUB_ENV
+        echo "SIGNPACKAGE_JAR=$RUNNER_TEMP/signpackage/target/SignPackage-1.0-jar-with-dependencies.jar" >> $GITHUB_ENV
 
     - name: Sign app contents with SignPackage
       shell: bash
